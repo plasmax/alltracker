@@ -150,7 +150,8 @@ def run(model, args):
         
         # Nuke STMap: R=U, G=V, B=0, A=Mask
         # OpenCV imwrite BGR: B=0, G=V, R=U, A=Mask
-        out_exr = np.dstack([np.zeros_like(alpha), uv_map[:,:,1], uv_map[:,:,0], alpha]).astype(np.float32)
+        # Invert V for Nuke (bottom-left 0,0), so we use 1.0 - V
+        out_exr = np.dstack([np.zeros_like(alpha), 1.0 - uv_map[:,:,1], uv_map[:,:,0], alpha]).astype(np.float32)
         cv2.imwrite(printf_pat % frame_nums[t], out_exr)
 
     with ThreadPoolExecutor() as executor:
