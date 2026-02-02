@@ -1,8 +1,9 @@
+import os
+os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 import torch
 import cv2
 import argparse
 import numpy as np
-import os
 import glob
 import re
 import utils.saveload
