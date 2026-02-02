@@ -181,59 +181,67 @@ def run(model, args):
         if args.matchmove:
             # Inverse Map Generation (Splatting)
             # trajs_cpu[t] is (2, H, W)
-            H_map, W_map = trajs_cpu.shape[2], trajs_cpu.shape[3]
+            H_src, W_src = trajs_cpu.shape[2], trajs_cpu.shape[3]
+            H_map, W_map = H_src, W_src # We use same resolution for output map
             
-            # Destination coordinates (where the pixels form Frame 0 went)
+            # Destination coordinates (where the pixels from Frame 0 went)
             # trajs_cpu[t] is (2, H, W) -> transpose to (H, W, 2)
             dest_uv = trajs_cpu[t].transpose(1, 2, 0).reshape(-1, 2)
             
-            # Source coordinates (their original identity) are source_uv_flat
+            # Source coordinates (their original identity)
+            # source_uv_flat is (N, 2)
             
-            # Filter by visibility to reduce noise
-            valid = vis_cpu[t].reshape(-1) > 0.5
+            # Calculate pixel coordinates
+            dest_x_f = dest_uv[:, 0] * (W_map - 1)
+            dest_y_f = dest_uv[:, 1] * (H_map - 1)
             
-            dest_x = (dest_uv[valid, 0] * (W_map - 1)).astype(np.int32)
-            dest_y = (dest_uv[valid, 1] * (H_map - 1)).astype(np.int32)
+            # Filter by visibility AND strict bounds to avoid edge piling artifacts
+            vis_flat = vis_cpu[t].reshape(-1)
+            valid = (vis_flat > 0.5) & \
+                    (dest_x_f >= 0) & (dest_x_f <= W_map - 1) & \
+                    (dest_y_f >= 0) & (dest_y_f <= H_map - 1)
             
-            # Clip
-            dest_x = np.clip(dest_x, 0, W_map - 1)
-            dest_y = np.clip(dest_y, 0, H_map - 1)
+            dest_x = np.round(dest_x_f[valid]).astype(np.int32)
+            dest_y = np.round(dest_y_f[valid]).astype(np.int32)
             
             # Initialize Inverse Map
-            # Channels: U, V, Weight
+            # Channels: U, V, Weight/Vis
             inv_map = np.zeros((H_map, W_map, 3), dtype=np.float32)
             
+            # Values to splat
+            vals_uv = source_uv_flat[valid].copy()
+            vals_uv[:, 1] = 1.0 - vals_uv[:, 1] # Invert V for Nuke
+            vals_vis = vis_flat[valid]
+            
             # Splat (Latest write wins)
-            # Nuke expects 0,0 BL, so invert V of the SOURCE value
-            vals = source_uv_flat[valid].copy()
-            vals[:, 1] = 1.0 - vals[:, 1]
+            inv_map[dest_y, dest_x, 0] = vals_uv[:, 0] # U
+            inv_map[dest_y, dest_x, 1] = vals_uv[:, 1] # V
+            inv_map[dest_y, dest_x, 2] = vals_vis      # Alpha (Confidence)
             
-            inv_map[dest_y, dest_x, 0] = vals[:, 0] # U
-            inv_map[dest_y, dest_x, 1] = vals[:, 1] # V (Inverted)
-            inv_map[dest_y, dest_x, 2] = 1.0        # Mask
+            # Create a binary mask of where we actually have data
+            # (We use a separate mask because alpha itself is continuous)
+            data_mask = np.zeros((H_map, W_map), dtype=np.uint8)
+            data_mask[dest_y, dest_x] = 255
             
-            # Hole Filling (Inpainting)
-            mask = (inv_map[:, :, 2] == 0).astype(np.uint8)
+            # Hole filling (Inpainting)
+            # We treat pixels with NO data as holes.
+            hole_mask = cv2.bitwise_not(data_mask)
             
-            # If mask is empty, we are good. If mask is full, we failed.
-            if np.sum(mask) > 0 and np.sum(mask) < mask.size:
-                # cv2.inpaint requires 8-bit or 16-bit input image? 
-                # Actually inpaint works on 8-bit, 16-bit unsigned, 32-bit float.
-                # But it expects the IMAGE to be one of those.
-                inv_map[:, :, 0] = cv2.inpaint(inv_map[:, :, 0], mask, 3, cv2.INPAINT_TELEA)
-                inv_map[:, :, 1] = cv2.inpaint(inv_map[:, :, 1], mask, 3, cv2.INPAINT_TELEA)
-                # For alpha, we might want to keep it soft or binary?
-                # If we inpaint alpha, it becomes 1 everywhere.
-                # For matchmove, we usually want alpha=0 where there is NO surface.
-                # But inpainting fills the holes...
-                # Let's set alpha to 1 where we filled holes.
-                inv_map[:, :, 2] = 1.0 - (mask/255.0) # This logic is circular.
-                # Actually, strictly, the "Texture" should only appear where the object truly IS.
-                # Inpainting fills *cracks* but also *large regions* if we let it.
-                # We should probably only inpaint small cracks.
-                # But for now, full inpaint is safer visually than holes.
-                inv_map[:, :, 2] = 1.0 # Assuming we filled everything
-            
+            # Only inpaint if we have some data but not all
+            if np.sum(data_mask) > 0 and np.sum(hole_mask) > 0:
+                # Inpaint UVs
+                inv_map[:, :, 0] = cv2.inpaint(inv_map[:, :, 0], hole_mask, 3, cv2.INPAINT_TELEA)
+                inv_map[:, :, 1] = cv2.inpaint(inv_map[:, :, 1], hole_mask, 3, cv2.INPAINT_TELEA)
+                
+                # For Alpha, we can choose to inpaint it (propagate confidence) 
+                # or leave it 0 (showing it's hallucinated).
+                # User asked for "confidence map". Usually hallucinations have 0 confidence?
+                # But if we inpaint the UVs, we want them to be usable.
+                # Let's simple-dilate the alpha mask slightly to cover cracks, 
+                # but leave large holes as 0. 
+                # Actually, cv2.inpaint on alpha works well to propagate local confidence.
+                inv_map[:, :, 2] = cv2.inpaint(inv_map[:, :, 2], hole_mask, 3, cv2.INPAINT_TELEA)
+
             out_exr = np.dstack([np.zeros_like(inv_map[:,:,0]), inv_map[:,:,1], inv_map[:,:,0], inv_map[:,:,2]]).astype(np.float32)
         
         else:
@@ -267,11 +275,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     model = Net(args.window_len, use_basicencoder=args.tiny, no_split=args.tiny)
+
+    checkpoint = "checkpoints/alltracker.pth"
     if args.ckpt_init:
-        utils.saveload.load(None, args.ckpt_init, model)
-    else:
-        url = f"https://huggingface.co/aharley/alltracker/resolve/main/alltracker{'_tiny' if args.tiny else ''}.pth"
-        model.load_state_dict(torch.hub.load_state_dict_from_url(url, map_location='cpu')['model'])
+        checkpoint = args.ckpt_init
+
+    utils.saveload.load(None, checkpoint, model)
     
     model.cuda().eval()
     run(model, args)
