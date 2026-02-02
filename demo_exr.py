@@ -10,6 +10,8 @@ import utils.saveload
 import utils.basic
 import utils.improc
 from nets.alltracker import Net
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 def parse_pattern(pattern):
     """
@@ -33,6 +35,23 @@ def extract_frame_num(filename):
     nums = re.findall(r'\d+', filename)
     return int(nums[-1]) if nums else 0
 
+def process_single_exr(f):
+    im = cv2.imread(f, cv2.IMREAD_UNCHANGED)
+    if im is None:
+        return None
+
+    if len(im.shape) == 2:
+        im = cv2.cvtColor(im, cv2.COLOR_GRAY2RGB)
+    elif im.shape[2] == 4:
+        im = im[:, :, :3]
+    
+    # Convert linear EXR to sRGB for the model
+    im = np.clip(im, 0.0, 1.0)
+    im = np.power(im, 1.0/2.2)
+    im = (im * 255).astype(np.uint8)
+    im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+    return im
+
 def read_exr_sequence(pattern, args):
     glob_pat, _ = parse_pattern(pattern)
     files = sorted(glob.glob(glob_pat))
@@ -41,31 +60,24 @@ def read_exr_sequence(pattern, args):
         print(f"No files found matching: {glob_pat}")
         return [], None, []
 
+    print(f"Found {len(files)} files. Loading...")
+    t0 = time.time()
+    
+    with ThreadPoolExecutor() as executor:
+        images = list(executor.map(process_single_exr, files))
+
     frames = []
     original_hw = None
     frame_nums = []
 
-    for f in files:
-        frame_nums.append(extract_frame_num(f))
-        im = cv2.imread(f, cv2.IMREAD_UNCHANGED)
-        if im is None:
-            continue
-
-        if len(im.shape) == 2:
-            im = cv2.cvtColor(im, cv2.COLOR_GRAY2RGB)
-        elif im.shape[2] == 4:
-            im = im[:, :, :3]
-        
-        if original_hw is None:
-            original_hw = im.shape[:2]
-
-        # Convert linear EXR to sRGB for the model
-        im = np.clip(im, 0.0, 1.0)
-        im = np.power(im, 1.0/2.2)
-        im = (im * 255).astype(np.uint8)
-        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
-        frames.append(im)
+    for i, im in enumerate(images):
+        if im is not None:
+            frames.append(im)
+            frame_nums.append(extract_frame_num(files[i]))
+            if original_hw is None:
+                original_hw = im.shape[:2]
     
+    print(f"Loaded {len(frames)} frames in {time.time()-t0:.2f}s")
     return frames, original_hw, frame_nums
 
 def forward_sequence(rgbs, model, args):
@@ -105,11 +117,22 @@ def run(model, args):
     scale = min(args.image_size / H_orig, args.image_size / W_orig)
     H_model, W_model = int(H_orig * scale) // 8 * 8, int(W_orig * scale) // 8 * 8
     
-    rgbs_resized = [cv2.resize(rgb, (W_model, H_model)) for rgb in rgbs_list]
+    print(f"Resizing to {W_model}x{H_model}...")
+    t0 = time.time()
+    def resize_one(rgb):
+        return cv2.resize(rgb, (W_model, H_model))
+    
+    with ThreadPoolExecutor() as executor:
+        rgbs_resized = list(executor.map(resize_one, rgbs_list))
+    print(f"Resized in {time.time()-t0:.2f}s")
+
     rgbs_tensor = torch.stack([torch.from_numpy(r).permute(2,0,1) for r in rgbs_resized]).unsqueeze(0).float().cuda()
 
+    print("Running inference...")
+    t0 = time.time()
     with torch.no_grad():
         trajs_uv, vis_mask = forward_sequence(rgbs_tensor, model, args)
+    print(f"Inference finished in {time.time()-t0:.2f}s")
 
     _, printf_pat = parse_pattern(args.output)
     out_dir = os.path.dirname(printf_pat)
@@ -118,14 +141,22 @@ def run(model, args):
     trajs_cpu = trajs_uv[0].cpu().numpy()
     vis_cpu = vis_mask[0].cpu().numpy()
 
-    for t in range(trajs_cpu.shape[0]):
-        uv_map = cv2.resize(trajs_cpu[t].transpose(1, 2, 0), (W_orig, H_orig))
-        alpha = cv2.resize(vis_cpu[t], (W_orig, H_orig))
+    print("Saving EXR files...")
+    t0 = time.time()
+    
+    def save_one(t):
+        uv_map = trajs_cpu[t].transpose(1, 2, 0)
+        alpha = vis_cpu[t]
         
         # Nuke STMap: R=U, G=V, B=0, A=Mask
         # OpenCV imwrite BGR: B=0, G=V, R=U, A=Mask
         out_exr = np.dstack([np.zeros_like(alpha), uv_map[:,:,1], uv_map[:,:,0], alpha]).astype(np.float32)
         cv2.imwrite(printf_pat % frame_nums[t], out_exr)
+
+    with ThreadPoolExecutor() as executor:
+        list(executor.map(save_one, range(trajs_cpu.shape[0])))
+    
+    print(f"Saved {trajs_cpu.shape[0]} EXR files in {time.time()-t0:.2f}s")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
